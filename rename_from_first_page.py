@@ -143,6 +143,50 @@ def call_ollama_extract(
         raise SystemExit("JSONの解析に失敗しました。出力を確認してください。") from exc
 
 
+def _text_contains_arxiv(text: str, category: str) -> bool:
+    if not category:
+        return False
+    pattern = re.compile(r"\b[a-z][a-z\-]*\.[A-Z]{2}\b", re.IGNORECASE)
+    matches = pattern.findall(text)
+    return category in matches
+
+
+def _text_contains_msc(text: str, code: str) -> bool:
+    if not code:
+        return False
+    pattern = re.compile(r"\b\d{2}[A-Z]\d{2}\b")
+    return bool(pattern.search(text) and code in pattern.findall(text))
+
+
+def postprocess_predictions(
+    meta: dict[str, Any], text: str, fields: list[dict[str, Any]]
+) -> dict[str, Any]:
+    field_keys = {f["key"] for f in fields}
+
+    if "arxiv_category" in meta and "arxiv_category_predict" in field_keys:
+        arxiv_val = str(meta.get("arxiv_category") or "").strip()
+        if arxiv_val and not _text_contains_arxiv(text, arxiv_val):
+            meta["arxiv_category_predict"] = arxiv_val
+            meta["arxiv_category"] = ""
+
+    if "msc" in meta and "msc_predict" in field_keys:
+        msc_vals = meta.get("msc") or []
+        if isinstance(msc_vals, str):
+            msc_vals = [msc_vals]
+        msc_vals = [str(v).strip() for v in msc_vals if str(v).strip()]
+        if msc_vals:
+            explicit = [v for v in msc_vals if _text_contains_msc(text, v)]
+            inferred = [v for v in msc_vals if v not in explicit]
+            if inferred:
+                existing = meta.get("msc_predict") or []
+                if isinstance(existing, str):
+                    existing = [existing]
+                meta["msc_predict"] = list(dict.fromkeys(existing + inferred))
+            meta["msc"] = explicit
+
+    return meta
+
+
 def sanitize_filename_component(text: str) -> str:
     # Replace whitespace with underscore
     text = re.sub(r"\s+", "_", text.strip())
@@ -248,6 +292,7 @@ def main() -> int:
 
     text = load_first_page_text(pdf_path)
     meta = call_ollama_extract(text, model, fields, extra)
+    meta = postprocess_predictions(meta, text, fields)
 
     new_name = build_new_name(meta, rename_cfg)
     new_path = pdf_path.with_name(new_name)

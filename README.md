@@ -24,6 +24,7 @@
 ### 注意
 
 - Ollama を起動してから実行してください（例: `ollama serve`）。
+- DOI から BibTeX を取得する場合は [doi2bib](https://www.doi2bib.org/) が便利です。
 
 ## 設定ファイル（config.yml）
 
@@ -42,7 +43,13 @@ fields:
     type: list
   - key: arxiv_category
     type: string
-    description: arXivのカテゴリ（例: cs.AI）
+    description: "本文に明記されているarXivカテゴリ（例: cs.AI）"
+  - key: msc_predict
+    type: list
+    description: "本文にMSCが無い場合の推定MSC分類"
+  - key: arxiv_category_predict
+    type: string
+    description: "本文にarXivカテゴリが無い場合の推定"
   - key: summary_ja
     type: string
     description: 日本語の要約

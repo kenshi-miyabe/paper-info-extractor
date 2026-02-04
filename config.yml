@@ -15,9 +15,16 @@ fields:
     type: list
   - key: msc
     type: list
+    description: "本文に明記されているMSC分類"
+  - key: msc_predict
+    type: list
+    description: "本文にMSCが無い場合の推定MSC分類"
   - key: arxiv_category
     type: string
-    description: "arXivのカテゴリ（例: cs.AI）"
+    description: "本文に明記されているarXivカテゴリ（例: cs.AI）"
+  - key: arxiv_category_predict
+    type: string
+    description: "本文にarXivカテゴリが無い場合の推定"
   - key: summary_ja
     type: string
     description: 日本語の要約
@@ -30,4 +37,10 @@ rename:
 prompt:
   extra_instructions: >
     If a field is missing, use an empty string or empty array.
+    If MSC is explicitly present, fill only msc and leave msc_predict empty.
+    If arXiv category is explicitly present, fill only arxiv_category and leave arxiv_category_predict empty.
+    If MSC is not explicitly present, infer 1-3 likely MSC codes into msc_predict.
+    If arXiv category is not explicitly present, infer the most likely arXiv category into arxiv_category_predict.
+    Use the title, keywords, and journal context to infer.
+    Output standard MSC codes (e.g., 68Q30) and standard arXiv categories (e.g., cs.LO, math.LO).
     summary_ja must be written in Japanese.
