@@ -1,0 +1,33 @@
+model: gemma3:12b
+
+fields:
+  - key: title
+    type: string
+  - key: year
+    type: number
+  - key: authors
+    type: list
+  - key: journal
+    type: string
+  - key: doi
+    type: string
+  - key: keywords
+    type: list
+  - key: msc
+    type: list
+  - key: arxiv_category
+    type: string
+    description: "arXivのカテゴリ（例: cs.AI）"
+  - key: summary_ja
+    type: string
+    description: 日本語の要約
+
+rename:
+  author_key: authors
+  year_key: year
+  title_key: title
+
+prompt:
+  extra_instructions: >
+    If a field is missing, use an empty string or empty array.
+    summary_ja must be written in Japanese.

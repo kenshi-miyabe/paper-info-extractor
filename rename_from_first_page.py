@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract title/year/authors from first page text via Ollama and rename the PDF."""
+"""Extract metadata from first page text via Ollama and rename the PDF."""
 
 from __future__ import annotations
 
@@ -9,7 +9,21 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+
+DEFAULT_CONFIG_PATH = Path("./config.yml")
+
+DEFAULT_FIELDS = [
+    {"key": "title", "type": "string"},
+    {"key": "year", "type": "number"},
+    {"key": "authors", "type": "list"},
+    {"key": "journal", "type": "string"},
+    {"key": "doi", "type": "string"},
+    {"key": "keywords", "type": "list"},
+    {"key": "msc", "type": "list"},
+]
+DEFAULT_RENAME = {"author_key": "authors", "year_key": "year", "title_key": "title"}
 
 
 def load_first_page_text(pdf_path: Path) -> str:
@@ -31,17 +45,77 @@ def load_first_page_text(pdf_path: Path) -> str:
     return reader.pages[0].extract_text() or ""
 
 
-def call_ollama_extract(text: str, model: str) -> dict[str, Any]:
-    prompt = (
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "model": "gemma3:12b",
+            "fields": DEFAULT_FIELDS,
+            "rename": DEFAULT_RENAME,
+            "prompt": {"extra_instructions": "If a field is missing, use an empty string or empty array."},
+        }
+
+    try:
+        import yaml  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise SystemExit("PyYAML が見つかりません。例: uv add pyyaml") from exc
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise SystemExit("config.yml の形式が不正です。")
+    return data
+
+
+def _normalize_fields(fields: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = []
+    for item in fields:
+        if not isinstance(item, dict) or "key" not in item:
+            continue
+        normalized.append(
+            {
+                "key": str(item.get("key")),
+                "type": str(item.get("type", "string")),
+                "label": str(item.get("label") or item.get("key")),
+                "description": str(item.get("description") or ""),
+            }
+        )
+    return normalized
+
+
+def _field_type_label(field_type: str) -> str:
+    field_type = field_type.lower()
+    if field_type in {"list", "array"}:
+        return "array of strings"
+    if field_type in {"number", "int", "float"}:
+        return "number"
+    return "string"
+
+
+def build_prompt(text: str, fields: list[dict[str, Any]], extra: str) -> str:
+    keys = ", ".join(f["key"] for f in fields)
+    spec_lines = []
+    for field in fields:
+        desc = field.get("description", "").strip()
+        desc_part = f" ({desc})" if desc else ""
+        spec_lines.append(
+            f"- {field['key']}: {_field_type_label(field['type'])}{desc_part}"
+        )
+    spec_lines = "\n".join(spec_lines)
+    extra = (extra or "").strip()
+    extra_line = f"\n{extra}\n" if extra else "\n"
+    return (
         "You are a metadata extractor. "
         "From the following first-page text of an academic paper, "
-        "extract title, publication year, authors, journal, doi, keywords, and MSC. "
-        "Return ONLY valid JSON with keys: "
-        "title (string), year (number), authors (array of strings), "
-        "journal (string), doi (string), keywords (array of strings), msc (array of strings). "
-        "If a field is missing, use an empty string or empty array.\n\n"
+        "extract the fields listed below.\n\n"
+        f"Fields:\n{spec_lines}\n"
+        f"Return ONLY valid JSON with keys: {keys}.{extra_line}\n"
         f"TEXT:\n{text}\n"
     )
+
+
+def call_ollama_extract(
+    text: str, model: str, fields: list[dict[str, Any]], extra_instructions: str
+) -> dict[str, Any]:
+    prompt = build_prompt(text, fields, extra_instructions)
 
     result = subprocess.run(
         ["ollama", "run", model],
@@ -81,10 +155,14 @@ def sanitize_filename_component(text: str) -> str:
     return text.strip("_")
 
 
-def build_new_name(meta: dict[str, Any]) -> str:
-    title = str(meta.get("title") or "").strip()
-    year = str(meta.get("year") or "").strip()
-    authors = meta.get("authors") or []
+def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
+    title_key = str(rename_cfg.get("title_key") or "title")
+    year_key = str(rename_cfg.get("year_key") or "year")
+    author_key = str(rename_cfg.get("author_key") or "authors")
+
+    title = str(meta.get(title_key) or "").strip()
+    year = str(meta.get(year_key) or "").strip()
+    authors = meta.get(author_key) or []
 
     if isinstance(authors, str):
         authors = [authors]
@@ -108,21 +186,22 @@ def build_new_name(meta: dict[str, Any]) -> str:
     return f"{author_part}-{year_part}-{title_part}.pdf"
 
 
-def format_txt(meta: dict[str, Any]) -> str:
+def format_txt(meta: dict[str, Any], fields: list[dict[str, Any]]) -> str:
     def _list(value: Any) -> str:
         if isinstance(value, list):
             return ", ".join(str(v).strip() for v in value if str(v).strip())
         return str(value).strip()
 
-    lines = [
-        f"title: {str(meta.get('title') or '').strip()}",
-        f"year: {str(meta.get('year') or '').strip()}",
-        f"authors: {_list(meta.get('authors') or [])}",
-        f"journal: {str(meta.get('journal') or '').strip()}",
-        f"doi: {str(meta.get('doi') or '').strip()}",
-        f"keywords: {_list(meta.get('keywords') or [])}",
-        f"msc: {_list(meta.get('msc') or [])}",
-    ]
+    lines = []
+    for field in fields:
+        key = field["key"]
+        label = field.get("label") or key
+        value = meta.get(key)
+        if field["type"].lower() in {"list", "array"}:
+            value_str = _list(value or [])
+        else:
+            value_str = str(value or "").strip()
+        lines.append(f"{label}: {value_str}")
     return "\n".join(lines) + "\n"
 
 
@@ -135,9 +214,14 @@ def main() -> int:
         help="対象PDFのパス",
     )
     parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="設定ファイルのパス",
+    )
+    parser.add_argument(
         "--model",
-        default="gemma3:12b",
-        help="Ollamaモデル名",
+        default=None,
+        help="Ollamaモデル名（設定ファイルの上書き用）",
     )
     parser.add_argument(
         "--filename-only",
@@ -156,10 +240,16 @@ def main() -> int:
         print(f"PDFが見つかりません: {pdf_path}", file=sys.stderr)
         return 1
 
-    text = load_first_page_text(pdf_path)
-    meta = call_ollama_extract(text, args.model)
+    config = load_config(Path(args.config))
+    fields = _normalize_fields(config.get("fields") or DEFAULT_FIELDS)
+    rename_cfg = config.get("rename") or DEFAULT_RENAME
+    model = args.model or config.get("model") or "gemma3:12b"
+    extra = (config.get("prompt") or {}).get("extra_instructions", "")
 
-    new_name = build_new_name(meta)
+    text = load_first_page_text(pdf_path)
+    meta = call_ollama_extract(text, model, fields, extra)
+
+    new_name = build_new_name(meta, rename_cfg)
     new_path = pdf_path.with_name(new_name)
     txt_path = new_path.with_suffix(".txt")
 
@@ -170,7 +260,7 @@ def main() -> int:
     if args.filename_only:
         return 0
 
-    txt_path.write_text(format_txt(meta), encoding="utf-8")
+    txt_path.write_text(format_txt(meta, fields), encoding="utf-8")
 
     if args.info_only:
         return 0

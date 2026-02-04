@@ -18,10 +18,44 @@
 
 - `--filename-only`: ファイル名だけ確認（書き出しなし）
 - `--info-only`: TXTだけ出力（リネームなし）
+- `--config`: 設定ファイルのパス（デフォルトは `config.yml`）
+- `--model`: Ollama モデル名の上書き
 
 ### 注意
 
 - Ollama を起動してから実行してください（例: `ollama serve`）。
+
+## 設定ファイル（config.yml）
+
+抽出する項目や出力内容は `config.yml` で変更できます。  
+`fields` に追加した項目が TXT に出力され、プロンプトにも反映されます。
+
+例:
+```yaml
+model: gemma3:12b
+fields:
+  - key: title
+    type: string
+  - key: year
+    type: number
+  - key: authors
+    type: list
+  - key: arxiv_category
+    type: string
+    description: arXivのカテゴリ（例: cs.AI）
+  - key: summary_ja
+    type: string
+    description: 日本語の要約
+rename:
+  author_key: authors
+  year_key: year
+  title_key: title
+```
+
+`type` は `string` / `number` / `list` を想定しています。  
+`description` を書くと、プロンプト内で「そのキーが何を表すか」を明示できます。  
+コロン（`:`）を含む場合は `"..."` で囲んでください。  
+`label` を指定すると TXT の項目名を変更できます（例: `label: 要約（日本語）`）。
 
 ## 抽出対象
 
