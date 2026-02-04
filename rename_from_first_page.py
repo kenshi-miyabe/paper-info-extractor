@@ -15,14 +15,15 @@ from typing import Any, Iterable
 DEFAULT_CONFIG_PATH = Path("./config.yml")
 
 DEFAULT_FIELDS = [
-    {"key": "title", "type": "string", "stage": 1},
-    {"key": "year", "type": "number", "stage": 1},
-    {"key": "authors", "type": "list", "stage": 1},
-    {"key": "journal", "type": "string", "stage": 1},
-    {"key": "doi", "type": "string", "stage": 1},
-    {"key": "keywords", "type": "list", "stage": 1},
-    {"key": "msc", "type": "list", "stage": 1},
-    {"key": "arxiv_category", "type": "string", "stage": 1},
+    {"key": "title", "type": "string"},
+    {"key": "year", "type": "number"},
+    {"key": "authors", "type": "list"},
+    {"key": "journal", "type": "string"},
+    {"key": "doi", "type": "string"},
+    {"key": "keywords", "type": "list"},
+    {"key": "msc", "type": "list"},
+    {"key": "arxiv_category", "type": "string"},
+    {"key": "summary_ja", "type": "string"},
 ]
 DEFAULT_RENAME = {"author_key": "authors", "year_key": "year", "title_key": "title"}
 
@@ -53,10 +54,7 @@ def load_config(path: Path) -> dict[str, Any]:
             "validation": {"require_abstract": False},
             "fields": DEFAULT_FIELDS,
             "rename": DEFAULT_RENAME,
-            "prompt": {
-                "stage1_instructions": "If a field is missing, use an empty string or empty array.",
-                "stage2_instructions": "If a field is missing, use an empty string or empty array.",
-            },
+            "prompt": {"instructions": "If a field is missing, use an empty string or empty array."},
         }
 
     try:
@@ -81,7 +79,6 @@ def _normalize_fields(fields: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 "type": str(item.get("type", "string")),
                 "label": str(item.get("label") or item.get("key")),
                 "description": str(item.get("description") or ""),
-                "stage": int(item.get("stage", 1)),
             }
         )
     return normalized
@@ -96,7 +93,7 @@ def _field_type_label(field_type: str) -> str:
     return "string"
 
 
-def build_prompt(text: str, fields: list[dict[str, Any]], extra: str, context: dict[str, Any] | None) -> str:
+def build_prompt(text: str, fields: list[dict[str, Any]], instructions: str) -> str:
     keys = ", ".join(f["key"] for f in fields)
     spec_lines = []
     for field in fields:
@@ -106,15 +103,8 @@ def build_prompt(text: str, fields: list[dict[str, Any]], extra: str, context: d
             f"- {field['key']}: {_field_type_label(field['type'])}{desc_part}"
         )
     spec_lines = "\n".join(spec_lines)
-    extra = (extra or "").strip()
-    extra_line = f"\n{extra}\n" if extra else "\n"
-    context_block = ""
-    if context:
-        context_block = (
-            "\nKnown metadata (from stage 1):\n"
-            + json.dumps(context, ensure_ascii=False, indent=2)
-            + "\n"
-        )
+    instructions = (instructions or "").strip()
+    extra_line = f"\n{instructions}\n" if instructions else "\n"
     return (
         "You are a metadata extractor. "
         "From the following first-page text of an academic paper, "
@@ -122,7 +112,6 @@ def build_prompt(text: str, fields: list[dict[str, Any]], extra: str, context: d
         f"Fields:\n{spec_lines}\n"
         f"Return ONLY valid JSON with keys: {keys}.{extra_line}"
         f"TEXT:\n{text}\n"
-        f"{context_block}"
     )
 
 
@@ -130,10 +119,9 @@ def call_ollama_extract(
     text: str,
     model: str,
     fields: list[dict[str, Any]],
-    extra_instructions: str,
-    context: dict[str, Any] | None = None,
+    instructions: str,
 ) -> dict[str, Any]:
-    prompt = build_prompt(text, fields, extra_instructions, context)
+    prompt = build_prompt(text, fields, instructions)
 
     result = subprocess.run(
         ["ollama", "run", model],
@@ -235,86 +223,6 @@ def uniquify_path(path: Path) -> Path:
     raise SystemExit(f"同名ファイルが多すぎます: {path}")
 
 
-def _text_contains_arxiv(text: str, category: str) -> bool:
-    if not category:
-        return False
-    pattern = re.compile(r"\b[a-z][a-z\-]*\.[A-Z]{2}\b", re.IGNORECASE)
-    matches = pattern.findall(text)
-    return category in matches
-
-
-def _text_contains_msc(text: str, code: str) -> bool:
-    if not code:
-        return False
-    pattern = re.compile(r"\b\d{2}[A-Z]\d{2}\b")
-    return bool(pattern.search(text) and code in pattern.findall(text))
-
-
-def _extract_msc_code(value: str) -> str:
-    match = re.search(r"\b\d{2}[A-Z]\d{2}\b", value)
-    return match.group(0) if match else ""
-
-
-def _split_msc_labels(labels: list[str]) -> dict[str, str]:
-    mapping = {}
-    for label in labels:
-        code = _extract_msc_code(label)
-        if code:
-            mapping[code] = label
-    return mapping
-
-
-def postprocess_predictions(
-    meta: dict[str, Any], text: str, fields: list[dict[str, Any]]
-) -> dict[str, Any]:
-    field_keys = {f["key"] for f in fields}
-
-    if "arxiv_category" in meta and "arxiv_category_predict" in field_keys:
-        arxiv_val = str(meta.get("arxiv_category") or "").strip()
-        if arxiv_val and not _text_contains_arxiv(text, arxiv_val):
-            meta["arxiv_category_predict"] = arxiv_val
-            meta["arxiv_category"] = ""
-            if "arxiv_category_label" in meta and "arxiv_category_predict_label" in field_keys:
-                label = str(meta.get("arxiv_category_label") or "").strip()
-                if label:
-                    meta["arxiv_category_predict_label"] = label
-                meta["arxiv_category_label"] = ""
-
-    if "msc" in meta and "msc_predict" in field_keys:
-        msc_vals = meta.get("msc") or []
-        if isinstance(msc_vals, str):
-            msc_vals = [msc_vals]
-        msc_vals = [str(v).strip() for v in msc_vals if str(v).strip()]
-        if msc_vals:
-            explicit = [v for v in msc_vals if _text_contains_msc(text, v)]
-            inferred = [v for v in msc_vals if v not in explicit]
-            if inferred:
-                existing = meta.get("msc_predict") or []
-                if isinstance(existing, str):
-                    existing = [existing]
-                meta["msc_predict"] = list(dict.fromkeys(existing + inferred))
-            meta["msc"] = explicit
-            if "msc_label" in meta and "msc_predict_label" in field_keys:
-                labels = meta.get("msc_label") or []
-                if isinstance(labels, str):
-                    labels = [labels]
-                labels = [str(v).strip() for v in labels if str(v).strip()]
-                label_map = _split_msc_labels(labels)
-                explicit_labels = [label_map[c] for c in explicit if c in label_map]
-                inferred_labels = [label_map[c] for c in inferred if c in label_map]
-                if inferred_labels:
-                    existing_labels = meta.get("msc_predict_label") or []
-                    if isinstance(existing_labels, str):
-                        existing_labels = [existing_labels]
-                    existing_labels = [str(v).strip() for v in existing_labels if str(v).strip()]
-                    meta["msc_predict_label"] = list(
-                        dict.fromkeys(existing_labels + inferred_labels)
-                    )
-                meta["msc_label"] = explicit_labels
-
-    return meta
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -343,6 +251,11 @@ def main() -> int:
         action="store_true",
         help="リネームは行わずにTXTのみ出力",
     )
+    parser.add_argument(
+        "--msc-predict",
+        action="store_true",
+        help="(未使用) 互換性のため残しています",
+    )
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf)
@@ -354,12 +267,8 @@ def main() -> int:
     fields = _normalize_fields(config.get("fields") or DEFAULT_FIELDS)
     rename_cfg = config.get("rename") or DEFAULT_RENAME
     model = args.model or config.get("model") or "gemma3:12b"
-    prompt_cfg = config.get("prompt") or {}
-    extra_stage1 = prompt_cfg.get(
-        "stage1_instructions", "If a field is missing, use an empty string or empty array."
-    )
-    extra_stage2 = prompt_cfg.get(
-        "stage2_instructions", "If a field is missing, use an empty string or empty array."
+    instructions = (config.get("prompt") or {}).get(
+        "instructions", "If a field is missing, use an empty string or empty array."
     )
     validation = config.get("validation") or {}
 
@@ -369,19 +278,7 @@ def main() -> int:
             print("Abstract が見つからないためスキップします。", file=sys.stderr)
             return 1
 
-    fields_stage1 = [f for f in fields if f.get("stage", 1) == 1]
-    fields_stage2 = [f for f in fields if f.get("stage", 1) == 2]
-
-    meta_stage1 = call_ollama_extract(text, model, fields_stage1, extra_stage1)
-
-    meta_stage2: dict[str, Any] = {}
-    if fields_stage2:
-        meta_stage2 = call_ollama_extract(
-            text, model, fields_stage2, extra_stage2, context=meta_stage1
-        )
-
-    meta = {**meta_stage1, **meta_stage2}
-    meta = postprocess_predictions(meta, text, fields)
+    meta = call_ollama_extract(text, model, fields, instructions)
 
     new_name = build_new_name(meta, rename_cfg)
     new_path = pdf_path.with_name(new_name)
@@ -395,12 +292,18 @@ def main() -> int:
     if args.filename_only:
         return 0
 
+    if not args.info_only:
+        if pdf_path != new_path:
+            pdf_path.rename(new_path)
+
     txt_path.write_text(format_txt(meta, fields), encoding="utf-8")
+
+    if args.msc_predict:
+        print("msc_predict は現在無効です。", file=sys.stderr)
 
     if args.info_only:
         return 0
 
-    pdf_path.rename(new_path)
     return 0
 
 

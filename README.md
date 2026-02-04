@@ -20,6 +20,7 @@
 - `--info-only`: TXTだけ出力（リネームなし）
 - `--config`: 設定ファイルのパス（デフォルトは `config.yml`）
 - `--model`: Ollama モデル名の上書き
+- `--msc-predict`: `msc_predict.py` を実行して MSC 推定を追記
 
 ### 注意
 
@@ -42,74 +43,32 @@ validation:
   require_abstract: true
 ```
 
-### ステージ分割
-
-LLMの負荷を下げるため、`stage` を使って抽出を2回に分けます。  
-`stage: 1` はタイトル等の基礎情報、`stage: 2` は推定や要約に使う想定です。
-`prompt.stage1_instructions` / `prompt.stage2_instructions` で各ステージの指示文を分けられます。
+### フィールド設定
 
 例:
 ```yaml
 model: gemma3:12b
-prompt:
-  stage1_instructions: >
-    If a field is missing, use an empty string or empty array.
-  stage2_instructions: >
-    If a field is missing, use an empty string or empty array.
 fields:
   - key: title
     type: string
-    stage: 1
   - key: year
     type: number
-    stage: 1
   - key: authors
     type: list
-    stage: 1
   - key: journal
     type: string
-    stage: 1
   - key: doi
     type: string
-    stage: 1
   - key: keywords
     type: list
-    stage: 1
   - key: msc
     type: list
-    stage: 1
     description: "本文に明記されているMSC分類"
-  - key: msc_label
-    type: list
-    stage: 1
-    description: "msc の各コードに対応するカテゴリ名（例: 68T05 Learning and adaptive systems）"
   - key: arxiv_category
     type: string
-    stage: 1
     description: "本文に明記されているarXivカテゴリ（例: cs.AI）"
-  - key: arxiv_category_label
-    type: string
-    stage: 1
-    description: "arXivカテゴリの名称（例: Logic in Computer Science）"
-  - key: msc_predict
-    type: list
-    stage: 2
-    description: "本文にMSCが無い場合の推定MSC分類"
-  - key: msc_predict_label
-    type: list
-    stage: 2
-    description: "msc_predict の各コードに対応するカテゴリ名（例: 68T05 Learning and adaptive systems）"
-  - key: arxiv_category_predict
-    type: string
-    stage: 2
-    description: "本文にarXivカテゴリが無い場合の推定"
-  - key: arxiv_category_predict_label
-    type: string
-    stage: 2
-    description: "推定したarXivカテゴリの名称"
   - key: summary_ja
     type: string
-    stage: 2
     description: 日本語の要約
 rename:
   author_key: authors
@@ -120,8 +79,7 @@ rename:
 `type` は `string` / `number` / `list` を想定しています。  
 `description` を書くと、プロンプト内で「そのキーが何を表すか」を明示できます。  
 コロン（`:`）を含む場合は `"..."` で囲んでください。  
-`label` を指定すると TXT の項目名を変更できます（例: `label: 要約（日本語）`）。  
-`msc_label` / `msc_predict_label` は対応するコードの説明を同じ並びで入れる想定です。
+`label` を指定すると TXT の項目名を変更できます（例: `label: 要約（日本語）`）。
 
 ## 抽出対象
 
@@ -152,6 +110,22 @@ rename:
 
 3. Ollama を起動  
    - 既に起動済みであればOK（例: `ollama serve`）
+
+## MSC 予測（msc_predict.py）
+
+`msc_predict.py` はメタデータTXTからMSCを1つ推定し、`msc_predict:` を追記します。  
+事前に `msc.csv`（MSCコード対応表）が必要です。
+
+使用例:
+```zsh
+uv run python msc_predict.py /path/to/metadata.txt
+```
+
+### 予測の流れ
+
+1. TXTの指定フィールド（既定: title, keywords, summary_ja, arxiv_category）からテキストを作る  
+2. MSCラベルとの単語一致スコアを計算し、最も高い1件を採用  
+3. `msc_predict:` に追記
 
 ## Finder から右クリックで実行する場合（Automator）
 

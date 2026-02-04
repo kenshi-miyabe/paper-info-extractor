@@ -1,62 +1,29 @@
 model: gemma3:12b
 
 validation:
-  require_abstract: true
+  require_abstract: false
 
 fields:
   - key: title
     type: string
-    stage: 1
   - key: year
     type: number
-    stage: 1
   - key: authors
     type: list
-    stage: 1
   - key: journal
     type: string
-    stage: 1
   - key: doi
     type: string
-    stage: 1
   - key: keywords
     type: list
-    stage: 1
   - key: msc
     type: list
-    stage: 1
     description: "本文に明記されているMSC分類"
-  - key: msc_label
-    type: list
-    stage: 1
-    description: "msc の各コードに対応するカテゴリ名（例: 68T05 Learning and adaptive systems）"
   - key: arxiv_category
     type: string
-    stage: 1
     description: "本文に明記されているarXivカテゴリ（例: cs.AI）"
-  - key: arxiv_category_label
-    type: string
-    stage: 1
-    description: "arXivカテゴリの名称（例: Logic in Computer Science）"
-  - key: msc_predict
-    type: list
-    stage: 2
-    description: "本文にMSCが無い場合の推定MSC分類"
-  - key: msc_predict_label
-    type: list
-    stage: 2
-    description: "msc_predict の各コードに対応するカテゴリ名（例: 68T05 Learning and adaptive systems）"
-  - key: arxiv_category_predict
-    type: string
-    stage: 2
-    description: "本文にarXivカテゴリが無い場合の推定"
-  - key: arxiv_category_predict_label
-    type: string
-    stage: 2
-    description: "推定したarXivカテゴリの名称"
   - key: summary_ja
     type: string
-    stage: 2
     description: 日本語の要約
 
 rename:
@@ -65,19 +32,7 @@ rename:
   title_key: title
 
 prompt:
-  stage1_instructions: >
-    Extract only what is explicitly written on the page.
+  instructions: >
+    Extract only what is explicitly written on the page for factual fields.
+    For summary_ja, generate a short Japanese summary in 2-4 sentences based on the page.
     If a field is missing, use an empty string or empty array.
-    If MSC is explicitly present, fill only msc and leave msc_predict empty.
-    If arXiv category is explicitly present, fill only arxiv_category and leave arxiv_category_predict empty.
-    If arXiv category is present, also provide arxiv_category_label.
-    If MSC is present, also provide msc_label.
-  stage2_instructions: >
-    Infer missing items only; do not overwrite explicit fields from stage 1.
-    If MSC is not explicitly present, infer 1-3 likely MSC codes into msc_predict.
-    If arXiv category is not explicitly present, infer the most likely arXiv category into arxiv_category_predict.
-    Use the title, keywords, and journal context to infer.
-    Output standard MSC codes (e.g., 68Q30) and standard arXiv categories (e.g., cs.LO, math.LO).
-    For each MSC code, also provide its category name in msc_predict_label (aligned with codes).
-    For arXiv category, also provide its category name in arxiv_category_predict_label.
-    summary_ja must be written in Japanese.
