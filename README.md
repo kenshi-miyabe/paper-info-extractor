@@ -1,11 +1,40 @@
-paper-info-extractor
+# paper-info-extractor
 
-Overview
-This repository contains tools and scripts for extracting structured information from academic papers.
+論文PDFから情報を抽出し、その内容に応じてファイル名をリネームし、同じ名前のTXTに要約/情報を書き出すスクリプトです。
 
-Getting Started
-- Review the project files in this directory.
-- Run the main entry point once identified.
+## 概要
 
-Notes
-- Add setup and usage details here as the project evolves.
+- 論文PDFを入力として情報を抽出します
+- 抽出した情報に基づいてPDFのファイル名をリネームします
+- 同じ名前の`*.txt`ファイルに、抽出した内容を書き出します
+
+## 使い方（想定）
+
+1. 対象のPDFを指定のフォルダに置く
+2. スクリプトを実行する（コマンド名は検討中）
+3. リネームされたPDFと同名の`*.txt`が生成される
+
+### オプション（予定）
+- `--filename-only`: ファイル名だけ確認（書き出しなし）
+- `--info-only`: TXTだけ出力（リネームなし）
+
+## 抽出対象（予定）
+
+- 著者名
+- 出版年
+- タイトル
+
+## リネーム規則（予定）
+
+出力ファイル名は以下の形式を想定しています。  
+`著者名-出版年-タイトル.pdf`
+
+補足:
+- 著者が複数いる場合は、著者名を`_`で連結します
+- 著者名は姓のみを使用します
+- タイトル中のスペースは`_`に置換します
+- ファイル名に不適切な文字は適宜置換・削除します
+
+## 備考
+
+- 詳細な実行方法や必要な依存関係は、プロジェクトの進行に合わせて追記してください。
