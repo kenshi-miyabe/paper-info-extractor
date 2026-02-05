@@ -10,6 +10,8 @@ fields:
     type: number
   - key: authors
     type: list
+  - key: affiliation
+    type: list
   - key: journal
     type: string
   - key: doi

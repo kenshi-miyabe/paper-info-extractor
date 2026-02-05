@@ -28,5 +28,5 @@ cd "$PROJECT_DIR"
 
 # Finder から渡された PDF を順に処理する
 for pdf in "$@"; do
-  "$UV" run python "$PROJECT_DIR/rename_from_first_page.py" --msc-predict "$pdf"
+  "$UV" run python "$PROJECT_DIR/rename_from_first_page.py" "$pdf"
 done

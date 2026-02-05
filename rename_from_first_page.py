@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,6 +20,7 @@ DEFAULT_FIELDS = [
     {"key": "title", "type": "string"},
     {"key": "year", "type": "number"},
     {"key": "authors", "type": "list"},
+    {"key": "affiliation", "type": "list"},
     {"key": "journal", "type": "string"},
     {"key": "doi", "type": "string"},
     {"key": "keywords", "type": "list"},
@@ -28,7 +31,16 @@ DEFAULT_FIELDS = [
 DEFAULT_RENAME = {"author_key": "authors", "year_key": "year", "title_key": "title"}
 
 
+class JsonExtractionError(Exception):
+    """Raised when model output cannot be parsed as JSON."""
+
+    def __init__(self, message: str, output: str) -> None:
+        super().__init__(message)
+        self.output = output
+
+
 def load_first_page_text(pdf_path: Path) -> str:
+    """Return extracted text from the first page of a PDF."""
     try:
         from pypdf import PdfReader  # type: ignore
     except ModuleNotFoundError:
@@ -40,7 +52,27 @@ def load_first_page_text(pdf_path: Path) -> str:
                 "例: uv add pypdf"
             ) from exc
 
-    reader = PdfReader(pdf_path)
+    data: bytes | None = None
+    for attempt in range(10):
+        try:
+            # Read into memory to avoid partial reads while cloud sync clients lock files.
+            data = pdf_path.read_bytes()
+            if not data:
+                raise OSError(11, "Resource deadlock avoided")
+            reader = PdfReader(io.BytesIO(data))
+            break
+        except OSError as exc:
+            # Automator 経由で一時的にファイルがロックされることがあるためリトライする。
+            if exc.errno == 11 and attempt < 9:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            hint = ""
+            if exc.errno == 11:
+                hint = "\nDropbox 配下の場合は、きちんとダウンロードしてから再実行してください。"
+            raise SystemExit(
+                f"PDFの読み込みに失敗しました: {pdf_path}\n"
+                f"詳細: {exc}{hint}"
+            ) from exc
     if not reader.pages:
         raise SystemExit("PDFにページがありません。")
 
@@ -48,6 +80,7 @@ def load_first_page_text(pdf_path: Path) -> str:
 
 
 def load_config(path: Path) -> dict[str, Any]:
+    """Load YAML config or return built-in defaults when missing."""
     if not path.exists():
         return {
             "model": "gemma3:12b",
@@ -69,6 +102,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def _normalize_fields(fields: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize field definitions to a consistent shape."""
     normalized = []
     for item in fields:
         if not isinstance(item, dict) or "key" not in item:
@@ -85,6 +119,7 @@ def _normalize_fields(fields: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _field_type_label(field_type: str) -> str:
+    """Map config field types to prompt-friendly labels."""
     field_type = field_type.lower()
     if field_type in {"list", "array"}:
         return "array of strings"
@@ -94,6 +129,7 @@ def _field_type_label(field_type: str) -> str:
 
 
 def build_prompt(text: str, fields: list[dict[str, Any]], instructions: str) -> str:
+    """Build the LLM prompt used for metadata extraction."""
     keys = ", ".join(f["key"] for f in fields)
     spec_lines = []
     for field in fields:
@@ -121,6 +157,7 @@ def call_ollama_extract(
     fields: list[dict[str, Any]],
     instructions: str,
 ) -> dict[str, Any]:
+    """Run Ollama and parse the first JSON object from the output."""
     prompt = build_prompt(text, fields, instructions)
 
     result = subprocess.run(
@@ -138,18 +175,19 @@ def call_ollama_extract(
         )
 
     output = result.stdout.strip()
-    # Extract first JSON object from output, in case the model adds extra text.
+    # Extract the first JSON object in case the model adds extra text.
     match = re.search(r"\{[\s\S]*\}", output)
     if not match:
-        raise SystemExit("JSONの抽出に失敗しました。出力を確認してください。")
+        raise JsonExtractionError("JSONの抽出に失敗しました。", output)
 
     try:
         return json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        raise SystemExit("JSONの解析に失敗しました。出力を確認してください。") from exc
+        raise JsonExtractionError("JSONの解析に失敗しました。", output) from exc
 
 
 def sanitize_filename_component(text: str) -> str:
+    """Make a string safe to use as part of a filename."""
     # Replace whitespace with underscore
     text = re.sub(r"\s+", "_", text.strip())
     # Remove characters not suitable for filenames
@@ -162,6 +200,7 @@ def sanitize_filename_component(text: str) -> str:
 
 
 def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
+    """Create a new filename based on metadata and rename config."""
     title_key = str(rename_cfg.get("title_key") or "title")
     year_key = str(rename_cfg.get("year_key") or "year")
     author_key = str(rename_cfg.get("author_key") or "authors")
@@ -176,6 +215,7 @@ def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
     authors = [str(a).strip() for a in authors if str(a).strip()]
     surnames = []
     for name in authors:
+        # Prefer "Last, First" but fall back to the last token in the name.
         if "," in name:
             surname = name.split(",", 1)[0].strip()
         else:
@@ -193,6 +233,7 @@ def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
 
 
 def format_txt(meta: dict[str, Any], fields: list[dict[str, Any]]) -> str:
+    """Format extracted metadata as a labeled text block."""
     def _list(value: Any) -> str:
         if isinstance(value, list):
             return ", ".join(str(v).strip() for v in value if str(v).strip())
@@ -212,18 +253,30 @@ def format_txt(meta: dict[str, Any], fields: list[dict[str, Any]]) -> str:
 
 
 def uniquify_path(path: Path) -> Path:
+    """Append a numeric suffix if needed to avoid overwriting existing files."""
     if not path.exists():
         return path
     stem = path.stem
     suffix = path.suffix
     for i in range(2, 1000):
+        # Keep trying with _2, _3, ... until a free name is found.
         candidate = path.with_name(f"{stem}_{i}{suffix}")
         if not candidate.exists():
             return candidate
     raise SystemExit(f"同名ファイルが多すぎます: {path}")
 
 
+def append_ollama_log(log_path: Path, pdf_path: Path, output: str) -> None:
+    """Append Ollama output to a shared log file when JSON parsing fails."""
+    header = f"\n---\nPDF: {pdf_path}\n---\n"
+    existing = ""
+    if log_path.exists():
+        existing = log_path.read_text(encoding="utf-8")
+    log_path.write_text(existing + header + output + "\n", encoding="utf-8")
+
+
 def main() -> int:
+    """CLI entry point for extracting metadata and renaming a PDF."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "pdf",
@@ -259,7 +312,16 @@ def main() -> int:
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf)
-    if not pdf_path.exists():
+    pdf_paths: list[Path] = []
+    if pdf_path.is_dir():
+        # Only process PDFs directly under the given directory (no recursion).
+        pdf_paths = sorted(p for p in pdf_path.glob("*.pdf") if p.is_file())
+        if not pdf_paths:
+            print(f"PDFが見つかりません: {pdf_path}", file=sys.stderr)
+            return 1
+    elif pdf_path.exists():
+        pdf_paths = [pdf_path]
+    else:
         print(f"PDFが見つかりません: {pdf_path}", file=sys.stderr)
         return 1
 
@@ -272,39 +334,56 @@ def main() -> int:
     )
     validation = config.get("validation") or {}
 
-    text = load_first_page_text(pdf_path)
-    if validation.get("require_abstract"):
-        if "abstract" not in text.lower():
-            print("Abstract が見つからないためスキップします。", file=sys.stderr)
-            return 1
+    any_failed = False
+    log_path = Path(__file__).resolve().parent / "log.txt"
+    for pdf_path in pdf_paths:
+        text = load_first_page_text(pdf_path)
+        if validation.get("require_abstract"):
+            if "abstract" not in text.lower():
+                # Optional guard to skip files without an Abstract section.
+                print(
+                    f"Abstract が見つからないためスキップします: {pdf_path}",
+                    file=sys.stderr,
+                )
+                any_failed = True
+                continue
 
-    meta = call_ollama_extract(text, model, fields, instructions)
+        try:
+            meta = call_ollama_extract(text, model, fields, instructions)
+        except JsonExtractionError as exc:
+            append_ollama_log(log_path, pdf_path, exc.output)
+            print(
+                f"JSONの解析に失敗しました。ログを確認してください: {log_path}",
+                file=sys.stderr,
+            )
+            any_failed = True
+            continue
 
-    new_name = build_new_name(meta, rename_cfg)
-    new_path = pdf_path.with_name(new_name)
-    new_path = uniquify_path(new_path)
-    txt_path = new_path.with_suffix(".txt")
+        new_name = build_new_name(meta, rename_cfg)
+        new_path = pdf_path.with_name(new_name)
+        new_path = uniquify_path(new_path)
+        txt_path = new_path.with_suffix(".txt")
 
-    print("metadata:")
-    print(json.dumps(meta, ensure_ascii=False, indent=2))
-    print(f"new_name: {new_name}")
+        print("metadata:")
+        print(json.dumps(meta, ensure_ascii=False, indent=2))
+        print(f"new_name: {new_name}")
 
-    if args.filename_only:
-        return 0
+        if args.filename_only:
+            continue
 
-    if not args.info_only:
-        if pdf_path != new_path:
-            pdf_path.rename(new_path)
+        if not args.info_only:
+            if pdf_path != new_path:
+                pdf_path.rename(new_path)
 
-    txt_path.write_text(format_txt(meta, fields), encoding="utf-8")
+        txt_path.write_text(format_txt(meta, fields), encoding="utf-8")
 
     if args.msc_predict:
         print("msc_predict は現在無効です。", file=sys.stderr)
 
     if args.info_only:
-        return 0
+        return 1 if any_failed else 0
 
-    return 0
+    return 1 if any_failed else 0
 
 
 if __name__ == "__main__":

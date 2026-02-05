@@ -14,6 +14,8 @@
 2. スクリプトを実行する
 3. リネームされたPDFと同名の`*.txt`が生成される
 
+※ PDFの代わりにディレクトリを渡すと、その直下の`*.pdf`をまとめて処理します（サブディレクトリは対象外）。
+
 ### オプション（rename_from_first_page.py）
 
 - `--filename-only`: ファイル名だけ確認（書き出しなし）
@@ -54,6 +56,8 @@ fields:
   - key: year
     type: number
   - key: authors
+    type: list
+  - key: affiliation
     type: list
   - key: journal
     type: string
@@ -111,22 +115,6 @@ rename:
 3. Ollama を起動  
    - 既に起動済みであればOK（例: `ollama serve`）
 
-## MSC 予測（msc_predict.py）
-
-`msc_predict.py` はメタデータTXTからMSCを1つ推定し、`msc_predict:` を追記します。  
-事前に `msc.csv`（MSCコード対応表）が必要です。
-
-使用例:
-```zsh
-uv run python msc_predict.py /path/to/metadata.txt
-```
-
-### 予測の流れ
-
-1. TXTの指定フィールド（既定: title, keywords, summary_ja, arxiv_category）からテキストを作る  
-2. MSCラベルとの単語一致スコアを計算し、最も高い1件を採用  
-3. `msc_predict:` に追記
-
 ## Finder から右クリックで実行する場合（Automator）
 
 1. Automator を開き、「クイックアクション」を新規作成
@@ -137,3 +125,13 @@ uv run python msc_predict.py /path/to/metadata.txt
    例: `PROJECT_DIR="/Users/ユーザー名/パス/paper-info-extractor"`
 6. 修正後の内容をそのままコピーして貼り付ける
 7. 好きな名前で保存すると、Finder の右クリックメニューに表示されます
+
+## 内部動作（エンジニア向け）
+
+ざっくり以下の流れで動作します。
+
+1. PDFの1ページ目を読み込み、テキストを抽出する
+2. 抽出テキストと `config.yml` のフィールド定義からプロンプトを作成する
+3. Ollama 経由で生成AIに投げ、JSON形式のメタデータを取得する
+4. メタデータを元に新しいファイル名を組み立て、重複回避しつつリネームする
+5. 同名の `*.txt` を作成し、抽出結果を整形して書き出す
