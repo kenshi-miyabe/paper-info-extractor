@@ -199,6 +199,90 @@ def sanitize_filename_component(text: str) -> str:
     return text.strip("_")
 
 
+def _should_normalize_case(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 4:
+        return False
+    upper = sum(1 for c in letters if c.isupper())
+    lower = sum(1 for c in letters if c.islower())
+    if lower == 0:
+        return True
+    return upper / max(1, upper + lower) >= 0.85
+
+
+def _title_case_word(word: str) -> str:
+    if not any(c.isalpha() for c in word):
+        return word
+    if any(c.isdigit() for c in word):
+        return word
+    small_words = {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "but",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "nor",
+        "of",
+        "on",
+        "or",
+        "per",
+        "the",
+        "to",
+        "up",
+        "via",
+        "vs",
+        "with",
+        "yet",
+    }
+    if word.lower() in small_words:
+        return word.lower()
+    if word.isupper() and len(word) <= 3:
+        return word
+    lowered = word.lower()
+    return lowered[:1].upper() + lowered[1:]
+
+
+def normalize_caps_text(text: str) -> str:
+    """Normalize ALL-CAPS text to a more readable title case."""
+    if not text or not _should_normalize_case(text):
+        return text
+
+    tokens = re.split(r"(\s+)", text.strip())
+    normalized = []
+    for token in tokens:
+        if token.isspace():
+            normalized.append(token)
+            continue
+        parts = re.split(r"([-/])", token)
+        parts = [_title_case_word(p) if p not in {"-", "/"} else p for p in parts]
+        normalized.append("".join(parts))
+    return "".join(normalized)
+
+
+def normalize_meta_case(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> None:
+    """Normalize case for title/authors in place when they are all-caps."""
+    title_key = str(rename_cfg.get("title_key") or "title")
+    author_key = str(rename_cfg.get("author_key") or "authors")
+
+    title = meta.get(title_key)
+    if isinstance(title, str):
+        meta[title_key] = normalize_caps_text(title)
+
+    authors = meta.get(author_key)
+    if isinstance(authors, list):
+        meta[author_key] = [
+            normalize_caps_text(str(a).strip()) for a in authors if str(a).strip()
+        ]
+    elif isinstance(authors, str):
+        meta[author_key] = normalize_caps_text(authors)
+
+
 def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
     """Create a new filename based on metadata and rename config."""
     title_key = str(rename_cfg.get("title_key") or "title")
@@ -358,6 +442,8 @@ def main() -> int:
             )
             any_failed = True
             continue
+
+        normalize_meta_case(meta, rename_cfg)
 
         new_name = build_new_name(meta, rename_cfg)
         new_path = pdf_path.with_name(new_name)
