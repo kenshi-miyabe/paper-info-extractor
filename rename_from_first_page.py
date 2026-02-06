@@ -52,27 +52,20 @@ def load_first_page_text(pdf_path: Path) -> str:
                 "例: uv add pypdf"
             ) from exc
 
-    data: bytes | None = None
-    for attempt in range(10):
-        try:
-            # Read into memory to avoid partial reads while cloud sync clients lock files.
-            data = pdf_path.read_bytes()
-            if not data:
-                raise OSError(11, "Resource deadlock avoided")
-            reader = PdfReader(io.BytesIO(data))
-            break
-        except OSError as exc:
-            # Automator 経由で一時的にファイルがロックされることがあるためリトライする。
-            if exc.errno == 11 and attempt < 9:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-            hint = ""
-            if exc.errno == 11:
-                hint = "\nDropbox 配下の場合は、きちんとダウンロードしてから再実行してください。"
-            raise SystemExit(
-                f"PDFの読み込みに失敗しました: {pdf_path}\n"
-                f"詳細: {exc}{hint}"
-            ) from exc
+    try:
+        # Read into memory to avoid partial reads while cloud sync clients lock files.
+        data = pdf_path.read_bytes()
+        if not data:
+            raise OSError(11, "Resource deadlock avoided")
+        reader = PdfReader(io.BytesIO(data))
+    except OSError as exc:
+        hint = ""
+        if exc.errno == 11:
+            hint = "\n完全にダウンロードしてから再実行してください。"
+        raise SystemExit(
+            f"PDFの読み込みに失敗しました: {pdf_path}\n"
+            f"詳細: {exc}{hint}"
+        ) from exc
     if not reader.pages:
         raise SystemExit("PDFにページがありません。")
 
