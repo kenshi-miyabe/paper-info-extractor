@@ -192,6 +192,16 @@ def sanitize_filename_component(text: str) -> str:
     return text.strip("_")
 
 
+def truncate_filename_component(text: str, max_len: int) -> str:
+    """Truncate a filename component to a maximum length."""
+    if max_len <= 0:
+        return text
+    if len(text) <= max_len:
+        return text
+    trimmed = text[:max_len]
+    return trimmed.rstrip("_-")
+
+
 def _should_normalize_case(text: str) -> bool:
     letters = [c for c in text if c.isalpha()]
     if len(letters) < 4:
@@ -281,6 +291,8 @@ def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
     title_key = str(rename_cfg.get("title_key") or "title")
     year_key = str(rename_cfg.get("year_key") or "year")
     author_key = str(rename_cfg.get("author_key") or "authors")
+    author_max_len = int(rename_cfg.get("author_max_len") or 60)
+    title_max_len = int(rename_cfg.get("title_max_len") or 120)
 
     title = str(meta.get(title_key) or "").strip()
     year = str(meta.get(year_key) or "").strip()
@@ -305,6 +317,8 @@ def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
     title_part = sanitize_filename_component(title)
     author_part = sanitize_filename_component(author_part)
     year_part = sanitize_filename_component(year)
+    author_part = truncate_filename_component(author_part, author_max_len)
+    title_part = truncate_filename_component(title_part, title_max_len)
 
     return f"{author_part}-{year_part}-{title_part}.pdf"
 
