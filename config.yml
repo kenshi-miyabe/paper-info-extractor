@@ -1,4 +1,4 @@
-model: gemma3:12b
+model: gemma4:e4b
 
 validation:
   require_abstract: false

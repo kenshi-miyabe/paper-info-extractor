@@ -39,6 +39,9 @@ class JsonExtractionError(Exception):
         self.output = output
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
 def load_first_page_text(pdf_path: Path) -> str:
     """Return extracted text from the first page of a PDF."""
     try:
@@ -76,7 +79,7 @@ def load_config(path: Path) -> dict[str, Any]:
     """Load YAML config or return built-in defaults when missing."""
     if not path.exists():
         return {
-            "model": "gemma3:12b",
+            "model": "gemma4:e4b",
             "validation": {"require_abstract": False},
             "fields": DEFAULT_FIELDS,
             "rename": DEFAULT_RENAME,
@@ -144,6 +147,86 @@ def build_prompt(text: str, fields: list[dict[str, Any]], instructions: str) -> 
     )
 
 
+def clean_ollama_output(output: str) -> str:
+    """Remove terminal control sequences that break JSON parsing/log readability."""
+    output = output.replace("\r\n", "\n").replace("\r", "\n")
+    output = ANSI_ESCAPE_RE.sub("", output)
+    output = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", output)
+    return output.strip()
+
+
+def extract_json_candidate(output: str) -> str:
+    """Extract a likely JSON object from model output."""
+    fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", output, re.IGNORECASE)
+    if fenced:
+        return fenced.group(1)
+
+    start = output.find("{")
+    if start == -1:
+        raise JsonExtractionError("JSONの抽出に失敗しました。", output)
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(output[start:], start=start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return output[start : index + 1]
+
+    raise JsonExtractionError("JSONの抽出に失敗しました。", output)
+
+
+def repair_json_text(text: str) -> str:
+    """Repair common LLM JSON mistakes before parsing."""
+    repaired: list[str] = []
+    in_string = False
+    escaped = False
+
+    for char in text:
+        if in_string:
+            if escaped:
+                repaired.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                repaired.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                repaired.append(char)
+                in_string = False
+                continue
+            if char == "\n":
+                repaired.append("\\n")
+                continue
+            if char == "\t":
+                repaired.append("\\t")
+                continue
+            repaired.append(char)
+            continue
+
+        if char == '"':
+            in_string = True
+        repaired.append(char)
+
+    # Remove trailing commas before object/array closers.
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(repaired))
+
+
 def call_ollama_extract(
     text: str,
     model: str,
@@ -167,14 +250,12 @@ def call_ollama_extract(
             f"stderr: {result.stderr.strip()}"
         )
 
-    output = result.stdout.strip()
-    # Extract the first JSON object in case the model adds extra text.
-    match = re.search(r"\{[\s\S]*\}", output)
-    if not match:
-        raise JsonExtractionError("JSONの抽出に失敗しました。", output)
+    output = clean_ollama_output(result.stdout)
+    candidate = extract_json_candidate(output)
+    repaired = repair_json_text(candidate)
 
     try:
-        return json.loads(match.group(0))
+        return json.loads(repaired)
     except json.JSONDecodeError as exc:
         raise JsonExtractionError("JSONの解析に失敗しました。", output) from exc
 
@@ -339,7 +420,15 @@ def format_txt(meta: dict[str, Any], fields: list[dict[str, Any]]) -> str:
             value_str = _list(value or [])
         else:
             value_str = str(value or "").strip()
-        lines.append(f"{label}: {value_str}")
+
+        value_str = value_str.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if "\n" in value_str:
+            indented = "\n".join(
+                f"  {line}".rstrip() for line in value_str.split("\n")
+            )
+            lines.append(f"{label}:\n{indented}")
+        else:
+            lines.append(f"{label}: {value_str}")
     return "\n".join(lines) + "\n"
 
 
@@ -419,7 +508,7 @@ def main() -> int:
     config = load_config(Path(args.config))
     fields = _normalize_fields(config.get("fields") or DEFAULT_FIELDS)
     rename_cfg = config.get("rename") or DEFAULT_RENAME
-    model = args.model or config.get("model") or "gemma3:12b"
+    model = args.model or config.get("model") or "gemma4:e4b"
     instructions = (config.get("prompt") or {}).get(
         "instructions", "If a field is missing, use an empty string or empty array."
     )

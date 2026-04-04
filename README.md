@@ -49,7 +49,7 @@ validation:
 
 例:
 ```yaml
-model: gemma3:12b
+model: gemma4:e4b
 fields:
   - key: title
     type: string
@@ -107,7 +107,7 @@ rename:
 1. 依存ツールのインストール  
    - `uv` をインストール（例: `brew install uv`）
    - `Ollama` をインストールし、モデルを取得  
-     例: `ollama pull gemma3:12b`
+     例: `ollama pull gemma4:e4b`
 
 2. 依存パッケージの用意  
    - リポジトリ直下で `uv sync` を実行
