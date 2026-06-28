@@ -21,7 +21,7 @@
 - `--filename-only`: ファイル名だけ確認（書き出しなし）
 - `--info-only`: TXTだけ出力（リネームなし）
 - `--config`: 設定ファイルのパス（デフォルトは `config.yml`）
-- `--model`: Ollama モデル名の上書き
+- `--model`: Ollama モデル名の上書き（指定時はこの1つだけを試します）
 - `--msc-predict`: `msc_predict.py` を実行して MSC 推定を追記
 
 ### 注意
@@ -31,59 +31,36 @@
 
 ## 設定ファイル（config.yml）
 
-抽出する項目や出力内容は `config.yml` で変更できます。  
-`fields` に追加した項目が TXT に出力され、プロンプトにも反映されます。
-
-### バリデーション
-
-論文以外のPDFを避けたい場合は `validation` を設定します。  
-`require_abstract: true` の場合、1ページ目に `Abstract` が無いPDFはスキップします。
+`config.yml` では、使うモデル、2段階抽出のプロンプト、論文チェックの有無だけを設定します。
 
 例:
 ```yaml
-validation:
-  require_abstract: true
+models:
+  - gemma4:e4b
+  - llama3.1:8b
+
+check_paper: false
+
+prompts:
+  filename_json: |
+    Extract title, authors, and year.
+    Return JSON with keys: title, authors, year.
+
+  extra_text: |
+    Return plain text sections for affiliation, journal, doi, keywords,
+    MSC, arXiv category, and a short Japanese summary.
 ```
 
-### フィールド設定
+`models` は上から順に試されます。Ollama API の実行失敗やJSON解析失敗が起きた場合は、その時点の失敗内容を実行ログに追記して次のモデルへ進みます。  
 
-例:
-```yaml
-model: gemma4:e4b
-fields:
-  - key: title
-    type: string
-  - key: year
-    type: number
-  - key: authors
-    type: list
-  - key: affiliation
-    type: list
-  - key: journal
-    type: string
-  - key: doi
-    type: string
-  - key: keywords
-    type: list
-  - key: msc
-    type: list
-    description: "本文に明記されているMSC分類"
-  - key: arxiv_category
-    type: string
-    description: "本文に明記されているarXivカテゴリ（例: cs.AI）"
-  - key: summary_ja
-    type: string
-    description: 日本語の要約
-rename:
-  author_key: authors
-  year_key: year
-  title_key: title
-```
+抽出は2段階で行います。1回目はOllama APIのJSONモードを使い、ファイル名に必要な `title` / `authors` / `year` だけをJSONで取得します。2回目はそれ以外の要約や補足情報をプレーンテキストで生成し、同名のTXTに追記します。
 
-`type` は `string` / `number` / `list` を想定しています。  
-`description` を書くと、プロンプト内で「そのキーが何を表すか」を明示できます。  
-コロン（`:`）を含む場合は `"..."` で囲んでください。  
-`label` を指定すると TXT の項目名を変更できます（例: `label: 要約（日本語）`）。
+`check_paper: true` の場合、1ページ目に `Abstract` が無いPDFはスキップします。
+各プロンプトに `{text}` を書くと、その位置にPDFの1ページ目テキストを差し込みます。`{text}` が無い場合は、プロンプト末尾に自動で追加します。
+
+## ログ
+
+実行ごとに `logs/log_YYYYMMDD_HHMMSS.txt` を作成します。成功時はPDFごとの所要時間、使用モデル、出力先を書きます。失敗時は `timeout`、`json_parse_error`、`connection_error` などの種別と、モデル出力やAPI応答を記録します。
 
 ## 抽出対象
 
@@ -131,7 +108,8 @@ rename:
 ざっくり以下の流れで動作します。
 
 1. PDFの1ページ目を読み込み、テキストを抽出する
-2. 抽出テキストと `config.yml` のフィールド定義からプロンプトを作成する
-3. Ollama 経由で生成AIに投げ、JSON形式のメタデータを取得する
+2. 抽出テキストと `config.yml` のプロンプトからLLM入力を作成する
+3. Ollama APIのJSONモードで、ファイル名に必要な `title` / `authors` / `year` を取得する
 4. メタデータを元に新しいファイル名を組み立て、重複回避しつつリネームする
-5. 同名の `*.txt` を作成し、抽出結果を整形して書き出す
+5. Ollama APIで要約などの追加情報をプレーンテキスト生成する
+6. 同名の `*.txt` にファイル名用メタデータと追加情報を書き出す

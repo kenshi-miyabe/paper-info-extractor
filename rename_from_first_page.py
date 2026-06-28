@@ -7,39 +7,101 @@ import argparse
 import io
 import json
 import re
-import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 DEFAULT_CONFIG_PATH = Path("./config.yml")
+LOG_DIR_NAME = "logs"
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
-DEFAULT_FIELDS = [
-    {"key": "title", "type": "string"},
-    {"key": "year", "type": "number"},
-    {"key": "authors", "type": "list"},
-    {"key": "affiliation", "type": "list"},
-    {"key": "journal", "type": "string"},
-    {"key": "doi", "type": "string"},
-    {"key": "keywords", "type": "list"},
-    {"key": "msc", "type": "list"},
-    {"key": "arxiv_category", "type": "string"},
-    {"key": "summary_ja", "type": "string"},
-]
-DEFAULT_RENAME = {"author_key": "authors", "year_key": "year", "title_key": "title"}
+DEFAULT_FILENAME_PROMPT = """\
+You are a metadata extractor for academic papers.
+Extract only the metadata needed to rename a PDF from the first-page text.
+Use only information explicitly written on the page.
+Return a single JSON object with exactly these keys:
+- "title": string
+- "authors": array of strings
+- "year": number or string
+If a value is missing, use an empty string or empty array.
+"""
+
+DEFAULT_EXTRA_TEXT_PROMPT = """\
+You are writing a companion text file for an academic paper.
+Do not return JSON. Return plain text only.
+Write concise labeled sections for affiliation, journal, doi, keywords, MSC,
+arXiv category, and a short Japanese summary.
+For factual fields, use only information explicitly written on the page.
+For summaries, summarize based on the page.
+"""
 
 
 class JsonExtractionError(Exception):
     """Raised when model output cannot be parsed as JSON."""
 
-    def __init__(self, message: str, output: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        output: str,
+        kind: str = "json_parse_error",
+    ) -> None:
         super().__init__(message)
         self.output = output
+        self.kind = kind
+
+
+class OllamaRunError(Exception):
+    """Raised when Ollama exits with an error."""
+
+    def __init__(self, message: str, output: str, kind: str = "ollama_error") -> None:
+        super().__init__(message)
+        self.output = output
+        self.kind = kind
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+class RunLogger:
+    """Write a timestamped log file for one script execution."""
+
+    def __init__(self, log_path: Path) -> None:
+        self.path = log_path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("", encoding="utf-8")
+
+    def write(self, message: str = "") -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {message}" if message else ""
+        with self.path.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+
+    def section(self, title: str) -> None:
+        self.write()
+        self.write(f"=== {title} ===")
+
+
+def create_log_path() -> Path:
+    """Return a unique timestamped log file path."""
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_dir = Path(__file__).resolve().parent / LOG_DIR_NAME
+    path = log_dir / f"log_{timestamp}.txt"
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = log_dir / f"log_{timestamp}_{index}.txt"
+        if not candidate.exists():
+            return candidate
+    raise SystemExit("ログファイル名を決定できません。")
+
+
+def format_duration(start: float) -> str:
+    """Format elapsed seconds since start."""
+    return f"{time.monotonic() - start:.2f}s"
 
 
 def load_first_page_text(pdf_path: Path) -> str:
@@ -79,11 +141,12 @@ def load_config(path: Path) -> dict[str, Any]:
     """Load YAML config or return built-in defaults when missing."""
     if not path.exists():
         return {
-            "model": "gemma4:e4b",
-            "validation": {"require_abstract": False},
-            "fields": DEFAULT_FIELDS,
-            "rename": DEFAULT_RENAME,
-            "prompt": {"instructions": "If a field is missing, use an empty string or empty array."},
+            "models": ["gemma4:e4b"],
+            "check_paper": False,
+            "prompts": {
+                "filename_json": DEFAULT_FILENAME_PROMPT,
+                "extra_text": DEFAULT_EXTRA_TEXT_PROMPT,
+            },
         }
 
     try:
@@ -97,54 +160,39 @@ def load_config(path: Path) -> dict[str, Any]:
     return data
 
 
-def _normalize_fields(fields: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize field definitions to a consistent shape."""
-    normalized = []
-    for item in fields:
-        if not isinstance(item, dict) or "key" not in item:
-            continue
-        normalized.append(
-            {
-                "key": str(item.get("key")),
-                "type": str(item.get("type", "string")),
-                "label": str(item.get("label") or item.get("key")),
-                "description": str(item.get("description") or ""),
-            }
-        )
-    return normalized
+def _normalize_models(config: dict[str, Any], override_model: str | None) -> list[str]:
+    """Return model names in the order they should be attempted."""
+    if override_model:
+        return [override_model]
+
+    configured = config.get("models")
+    if isinstance(configured, list):
+        models = [
+            str(model).strip()
+            for model in configured
+            if model is not None and str(model).strip()
+        ]
+        if models:
+            return models
+
+    return ["gemma4:e4b"]
 
 
-def _field_type_label(field_type: str) -> str:
-    """Map config field types to prompt-friendly labels."""
-    field_type = field_type.lower()
-    if field_type in {"list", "array"}:
-        return "array of strings"
-    if field_type in {"number", "int", "float"}:
-        return "number"
-    return "string"
+def get_prompt(config: dict[str, Any], key: str, default: str) -> str:
+    """Return a configured prompt template."""
+    prompts = config.get("prompts") or {}
+    if isinstance(prompts, dict):
+        prompt = prompts.get(key)
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
+    return default.strip()
 
 
-def build_prompt(text: str, fields: list[dict[str, Any]], instructions: str) -> str:
-    """Build the LLM prompt used for metadata extraction."""
-    keys = ", ".join(f["key"] for f in fields)
-    spec_lines = []
-    for field in fields:
-        desc = field.get("description", "").strip()
-        desc_part = f" ({desc})" if desc else ""
-        spec_lines.append(
-            f"- {field['key']}: {_field_type_label(field['type'])}{desc_part}"
-        )
-    spec_lines = "\n".join(spec_lines)
-    instructions = (instructions or "").strip()
-    extra_line = f"\n{instructions}\n" if instructions else "\n"
-    return (
-        "You are a metadata extractor. "
-        "From the following first-page text of an academic paper, "
-        "extract the fields listed below.\n\n"
-        f"Fields:\n{spec_lines}\n"
-        f"Return ONLY valid JSON with keys: {keys}.{extra_line}"
-        f"TEXT:\n{text}\n"
-    )
+def render_prompt(template: str, text: str) -> str:
+    """Insert first-page text into a configured prompt."""
+    if "{text}" in template:
+        return template.replace("{text}", text)
+    return f"{template.rstrip()}\n\nTEXT:\n{text}\n"
 
 
 def clean_ollama_output(output: str) -> str:
@@ -163,7 +211,7 @@ def extract_json_candidate(output: str) -> str:
 
     start = output.find("{")
     if start == -1:
-        raise JsonExtractionError("JSONの抽出に失敗しました。", output)
+        raise JsonExtractionError("JSONの抽出に失敗しました。", output, "json_extract_error")
 
     depth = 0
     in_string = False
@@ -187,7 +235,7 @@ def extract_json_candidate(output: str) -> str:
             if depth == 0:
                 return output[start : index + 1]
 
-    raise JsonExtractionError("JSONの抽出に失敗しました。", output)
+    raise JsonExtractionError("JSONの抽出に失敗しました。", output, "json_extract_error")
 
 
 def repair_json_text(text: str) -> str:
@@ -227,37 +275,90 @@ def repair_json_text(text: str) -> str:
     return re.sub(r",(\s*[}\]])", r"\1", "".join(repaired))
 
 
-def call_ollama_extract(
-    text: str,
-    model: str,
-    fields: list[dict[str, Any]],
-    instructions: str,
-) -> dict[str, Any]:
-    """Run Ollama and parse the first JSON object from the output."""
-    prompt = build_prompt(text, fields, instructions)
+def call_ollama_generate(prompt: str, model: str, *, json_mode: bool) -> str:
+    """Call Ollama's generate API and return the model response text."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+    if json_mode:
+        payload["format"] = "json"
 
-    result = subprocess.run(
-        ["ollama", "run", model],
-        input=prompt,
-        text=True,
-        capture_output=True,
-        check=False,
+    request = urllib.request.Request(
+        OLLAMA_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
 
-    if result.returncode != 0:
-        raise SystemExit(
-            "ollama の実行に失敗しました。\n"
-            f"stderr: {result.stderr.strip()}"
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise OllamaRunError(
+            f"Ollama API がHTTPエラーを返しました: {exc.code}",
+            clean_ollama_output(body),
+            "http_error",
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise OllamaRunError(
+            "Ollama API に接続できませんでした。",
+            str(exc.reason),
+            "connection_error",
+        ) from exc
+    except TimeoutError as exc:
+        raise OllamaRunError("Ollama API がタイムアウトしました。", str(exc), "timeout") from exc
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise OllamaRunError(
+            "Ollama API の応答JSONを解析できません。",
+            body,
+            "api_response_json_parse_error",
+        ) from exc
+
+    if "error" in data:
+        raise OllamaRunError(
+            "Ollama API がエラーを返しました。",
+            str(data["error"]),
+            "api_error",
         )
 
-    output = clean_ollama_output(result.stdout)
+    return clean_ollama_output(str(data.get("response") or ""))
+
+
+def call_ollama_filename_metadata(
+    text: str,
+    model: str,
+    prompt_template: str,
+) -> dict[str, Any]:
+    """Ask Ollama for filename metadata using JSON mode."""
+    prompt = render_prompt(prompt_template, text)
+    output = call_ollama_generate(prompt, model, json_mode=True)
     candidate = extract_json_candidate(output)
     repaired = repair_json_text(candidate)
 
     try:
-        return json.loads(repaired)
+        meta = json.loads(repaired)
     except json.JSONDecodeError as exc:
-        raise JsonExtractionError("JSONの解析に失敗しました。", output) from exc
+        raise JsonExtractionError("JSONの解析に失敗しました。", output, "json_parse_error") from exc
+    if not isinstance(meta, dict):
+        raise JsonExtractionError("JSONがオブジェクトではありません。", output, "json_shape_error")
+    return meta
+
+
+def call_ollama_extra_text(
+    text: str,
+    model: str,
+    prompt_template: str,
+) -> str:
+    """Ask Ollama for non-filename information as plain text."""
+    prompt = render_prompt(prompt_template, text)
+    return call_ollama_generate(prompt, model, json_mode=False)
 
 
 def sanitize_filename_component(text: str) -> str:
@@ -349,35 +450,29 @@ def normalize_caps_text(text: str) -> str:
     return "".join(normalized)
 
 
-def normalize_meta_case(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> None:
+def normalize_meta_case(meta: dict[str, Any]) -> None:
     """Normalize case for title/authors in place when they are all-caps."""
-    title_key = str(rename_cfg.get("title_key") or "title")
-    author_key = str(rename_cfg.get("author_key") or "authors")
-
-    title = meta.get(title_key)
+    title = meta.get("title")
     if isinstance(title, str):
-        meta[title_key] = normalize_caps_text(title)
+        meta["title"] = normalize_caps_text(title)
 
-    authors = meta.get(author_key)
+    authors = meta.get("authors")
     if isinstance(authors, list):
-        meta[author_key] = [
+        meta["authors"] = [
             normalize_caps_text(str(a).strip()) for a in authors if str(a).strip()
         ]
     elif isinstance(authors, str):
-        meta[author_key] = normalize_caps_text(authors)
+        meta["authors"] = normalize_caps_text(authors)
 
 
-def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
+def build_new_name(meta: dict[str, Any]) -> str:
     """Create a new filename based on metadata and rename config."""
-    title_key = str(rename_cfg.get("title_key") or "title")
-    year_key = str(rename_cfg.get("year_key") or "year")
-    author_key = str(rename_cfg.get("author_key") or "authors")
-    author_max_len = int(rename_cfg.get("author_max_len") or 60)
-    title_max_len = int(rename_cfg.get("title_max_len") or 120)
+    author_max_len = 60
+    title_max_len = 120
 
-    title = str(meta.get(title_key) or "").strip()
-    year = str(meta.get(year_key) or "").strip()
-    authors = meta.get(author_key) or []
+    title = str(meta.get("title") or "").strip()
+    year = str(meta.get("year") or "").strip()
+    authors = meta.get("authors") or []
 
     if isinstance(authors, str):
         authors = [authors]
@@ -404,32 +499,25 @@ def build_new_name(meta: dict[str, Any], rename_cfg: dict[str, Any]) -> str:
     return f"{author_part}-{year_part}-{title_part}.pdf"
 
 
-def format_txt(meta: dict[str, Any], fields: list[dict[str, Any]]) -> str:
-    """Format extracted metadata as a labeled text block."""
-    def _list(value: Any) -> str:
-        if isinstance(value, list):
-            return ", ".join(str(v).strip() for v in value if str(v).strip())
-        return str(value).strip()
-
-    lines = []
-    for field in fields:
-        key = field["key"]
-        label = field.get("label") or key
-        value = meta.get(key)
-        if field["type"].lower() in {"list", "array"}:
-            value_str = _list(value or [])
-        else:
-            value_str = str(value or "").strip()
-
-        value_str = value_str.replace("\r\n", "\n").replace("\r", "\n").strip()
-        if "\n" in value_str:
-            indented = "\n".join(
-                f"  {line}".rstrip() for line in value_str.split("\n")
-            )
-            lines.append(f"{label}:\n{indented}")
-        else:
-            lines.append(f"{label}: {value_str}")
-    return "\n".join(lines) + "\n"
+def build_txt_content(meta: dict[str, Any], extra_text: str) -> str:
+    """Build the text file content from filename metadata and extra text."""
+    authors = meta.get("authors") or []
+    if isinstance(authors, list):
+        author_text = ", ".join(
+            str(author).strip() for author in authors if str(author).strip()
+        )
+    else:
+        author_text = str(authors).strip()
+    lines = [
+        f"title: {str(meta.get('title') or '').strip()}",
+        f"authors: {author_text}",
+        f"year: {str(meta.get('year') or '').strip()}",
+    ]
+    content = "\n".join(lines)
+    extra_text = extra_text.strip()
+    if extra_text:
+        content = f"{content}\n\n{extra_text}"
+    return content + "\n"
 
 
 def uniquify_path(path: Path) -> Path:
@@ -446,13 +534,96 @@ def uniquify_path(path: Path) -> Path:
     raise SystemExit(f"同名ファイルが多すぎます: {path}")
 
 
-def append_ollama_log(log_path: Path, pdf_path: Path, output: str) -> None:
-    """Append Ollama output to a shared log file when JSON parsing fails."""
-    header = f"\n---\nPDF: {pdf_path}\n---\n"
-    existing = ""
-    if log_path.exists():
-        existing = log_path.read_text(encoding="utf-8")
-    log_path.write_text(existing + header + output + "\n", encoding="utf-8")
+def log_model_failure(
+    logger: RunLogger,
+    stage: str,
+    model: str,
+    exc: OllamaRunError | JsonExtractionError,
+    start: float,
+) -> None:
+    """Write structured failure details for a model attempt."""
+    logger.write(
+        f"{stage}: failed model={model} kind={exc.kind} "
+        f"elapsed={format_duration(start)}"
+    )
+    logger.write(f"{stage}: error={exc}")
+    if exc.output:
+        logger.write(f"{stage}: output_start")
+        logger.write(exc.output)
+        logger.write(f"{stage}: output_end")
+
+
+def _prefer_model(models: list[str], preferred: str) -> list[str]:
+    """Return models with preferred first while preserving configured order."""
+    ordered = [preferred]
+    ordered.extend(model for model in models if model != preferred)
+    return ordered
+
+
+def extract_filename_metadata_with_model_fallback(
+    text: str,
+    models: list[str],
+    prompt_template: str,
+    logger: RunLogger,
+) -> tuple[dict[str, Any], str]:
+    """Try configured models for filename metadata, logging each failure."""
+    last_error = ""
+    for index, model in enumerate(models, start=1):
+        start = time.monotonic()
+        logger.write(f"filename_json: start model={model}")
+        try:
+            meta = call_ollama_filename_metadata(text, model, prompt_template)
+            logger.write(
+                f"filename_json: success model={model} elapsed={format_duration(start)}"
+            )
+            logger.write(f"filename_json: metadata={json.dumps(meta, ensure_ascii=False)}")
+            return meta, model
+        except (OllamaRunError, JsonExtractionError) as exc:
+            last_error = str(exc)
+            log_model_failure(logger, "filename_json", model, exc, start)
+            if index < len(models):
+                print(
+                    f"{model} で失敗したため次のモデルを試します。ログ: {logger.path}",
+                    file=sys.stderr,
+                )
+                logger.write(f"filename_json: fallback next_model={models[index]}")
+
+    raise JsonExtractionError(
+        "すべてのモデルで抽出に失敗しました。",
+        f"最後のエラー: {last_error}",
+        "all_models_failed",
+    )
+
+
+def extract_extra_text_with_model_fallback(
+    text: str,
+    models: list[str],
+    preferred_model: str,
+    prompt_template: str,
+    logger: RunLogger,
+) -> str:
+    """Try configured models for companion text, logging each failure."""
+    ordered_models = _prefer_model(models, preferred_model)
+    for index, model in enumerate(ordered_models, start=1):
+        start = time.monotonic()
+        logger.write(f"extra_text: start model={model}")
+        try:
+            output = call_ollama_extra_text(text, model, prompt_template)
+            logger.write(
+                f"extra_text: success model={model} chars={len(output)} "
+                f"elapsed={format_duration(start)}"
+            )
+            return output
+        except OllamaRunError as exc:
+            log_model_failure(logger, "extra_text", model, exc, start)
+            if index < len(ordered_models):
+                print(
+                    f"{model} で追加情報の生成に失敗したため次のモデルを試します。ログ: {logger.path}",
+                    file=sys.stderr,
+                )
+                logger.write(f"extra_text: fallback next_model={ordered_models[index]}")
+    logger.write("extra_text: failed all models; writing TXT without extra text")
+    return ""
 
 
 def main() -> int:
@@ -491,6 +662,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    run_start = time.monotonic()
+    logger = RunLogger(create_log_path())
+    logger.section("run")
+    logger.write(f"args={vars(args)}")
+
     pdf_path = Path(args.pdf)
     pdf_paths: list[Path] = []
     if pdf_path.is_dir():
@@ -498,50 +674,81 @@ def main() -> int:
         pdf_paths = sorted(p for p in pdf_path.glob("*.pdf") if p.is_file())
         if not pdf_paths:
             print(f"PDFが見つかりません: {pdf_path}", file=sys.stderr)
+            logger.write(f"failed kind=no_pdf_found path={pdf_path}")
+            logger.write(f"run: finished status=failed elapsed={format_duration(run_start)}")
             return 1
     elif pdf_path.exists():
         pdf_paths = [pdf_path]
     else:
         print(f"PDFが見つかりません: {pdf_path}", file=sys.stderr)
+        logger.write(f"failed kind=pdf_not_found path={pdf_path}")
+        logger.write(f"run: finished status=failed elapsed={format_duration(run_start)}")
         return 1
 
-    config = load_config(Path(args.config))
-    fields = _normalize_fields(config.get("fields") or DEFAULT_FIELDS)
-    rename_cfg = config.get("rename") or DEFAULT_RENAME
-    model = args.model or config.get("model") or "gemma4:e4b"
-    instructions = (config.get("prompt") or {}).get(
-        "instructions", "If a field is missing, use an empty string or empty array."
-    )
-    validation = config.get("validation") or {}
+    try:
+        config = load_config(Path(args.config))
+    except SystemExit as exc:
+        logger.write(f"config: failed kind=config_error path={args.config}")
+        logger.write(f"error={exc}")
+        logger.write(f"run: finished status=failed elapsed={format_duration(run_start)}")
+        raise
+    models = _normalize_models(config, args.model)
+    filename_prompt = get_prompt(config, "filename_json", DEFAULT_FILENAME_PROMPT)
+    extra_text_prompt = get_prompt(config, "extra_text", DEFAULT_EXTRA_TEXT_PROMPT)
+    check_paper = bool(config.get("check_paper"))
+    logger.write(f"config={Path(args.config)}")
+    logger.write(f"models={models}")
+    logger.write(f"check_paper={check_paper}")
+    logger.write(f"pdf_count={len(pdf_paths)}")
 
     any_failed = False
-    log_path = Path(__file__).resolve().parent / "log.txt"
     for pdf_path in pdf_paths:
-        text = load_first_page_text(pdf_path)
-        if validation.get("require_abstract"):
+        pdf_start = time.monotonic()
+        logger.section(f"pdf {pdf_path}")
+        try:
+            text = load_first_page_text(pdf_path)
+            logger.write(f"first_page_text_chars={len(text)}")
+        except SystemExit as exc:
+            logger.write(
+                f"pdf: failed kind=pdf_read_error elapsed={format_duration(pdf_start)}"
+            )
+            logger.write(f"error={exc}")
+            print(exc, file=sys.stderr)
+            any_failed = True
+            continue
+
+        if check_paper:
             if "abstract" not in text.lower():
                 # Optional guard to skip files without an Abstract section.
                 print(
                     f"Abstract が見つからないためスキップします: {pdf_path}",
                     file=sys.stderr,
                 )
+                logger.write(
+                    f"pdf: skipped kind=not_paper elapsed={format_duration(pdf_start)}"
+                )
                 any_failed = True
                 continue
 
         try:
-            meta = call_ollama_extract(text, model, fields, instructions)
+            meta, metadata_model = extract_filename_metadata_with_model_fallback(
+                text, models, filename_prompt, logger
+            )
         except JsonExtractionError as exc:
-            append_ollama_log(log_path, pdf_path, exc.output)
+            logger.write(
+                f"pdf: failed kind={exc.kind} elapsed={format_duration(pdf_start)}"
+            )
+            logger.write(f"error={exc}")
             print(
-                f"JSONの解析に失敗しました。ログを確認してください: {log_path}",
+                f"抽出に失敗しました。ログを確認してください: {logger.path}",
                 file=sys.stderr,
             )
             any_failed = True
             continue
 
-        normalize_meta_case(meta, rename_cfg)
+        normalize_meta_case(meta)
 
-        new_name = build_new_name(meta, rename_cfg)
+        new_name = build_new_name(meta)
         new_path = pdf_path.with_name(new_name)
         new_path = uniquify_path(new_path)
         txt_path = new_path.with_suffix(".txt")
@@ -549,22 +756,52 @@ def main() -> int:
         print("metadata:")
         print(json.dumps(meta, ensure_ascii=False, indent=2))
         print(f"new_name: {new_name}")
+        logger.write(f"new_name={new_name}")
 
         if args.filename_only:
+            logger.write("write_skipped=filename_only")
+            logger.write(f"pdf: success elapsed={format_duration(pdf_start)}")
             continue
+
+        extra_text = extract_extra_text_with_model_fallback(
+            text,
+            models,
+            metadata_model,
+            extra_text_prompt,
+            logger,
+        )
 
         if not args.info_only:
             if pdf_path != new_path:
                 pdf_path.rename(new_path)
+                logger.write(f"renamed_to={new_path}")
+            else:
+                logger.write("rename_skipped=same_path")
+        else:
+            logger.write("rename_skipped=info_only")
 
-        txt_path.write_text(format_txt(meta, fields), encoding="utf-8")
+        txt_path.write_text(
+            build_txt_content(meta, extra_text),
+            encoding="utf-8",
+        )
+        logger.write(f"txt_written={txt_path}")
+        logger.write(f"pdf: success elapsed={format_duration(pdf_start)}")
 
     if args.msc_predict:
         print("msc_predict は現在無効です。", file=sys.stderr)
+        logger.write("msc_predict: disabled")
 
     if args.info_only:
+        logger.write(
+            f"run: finished status={'failed' if any_failed else 'success'} "
+            f"elapsed={format_duration(run_start)}"
+        )
         return 1 if any_failed else 0
 
+    logger.write(
+        f"run: finished status={'failed' if any_failed else 'success'} "
+        f"elapsed={format_duration(run_start)}"
+    )
     return 1 if any_failed else 0
 
 

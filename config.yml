@@ -1,40 +1,25 @@
-model: gemma4:e4b
+models:
+  - qwen3.5:9b-mlx
+  - ornith:9b
+  - gemma4:12b-mlx
 
-validation:
-  require_abstract: false
+check_paper: false
 
-fields:
-  - key: title
-    type: string
-  - key: year
-    type: number
-  - key: authors
-    type: list
-  - key: affiliation
-    type: list
-  - key: journal
-    type: string
-  - key: doi
-    type: string
-  - key: keywords
-    type: list
-  - key: msc
-    type: list
-    description: "本文に明記されているMSC分類"
-  - key: arxiv_category
-    type: string
-    description: "本文に明記されているarXivカテゴリ（例: cs.AI）"
-  - key: summary_ja
-    type: string
-    description: 日本語の要約
+prompts:
+  filename_json: |
+    You are a metadata extractor for academic papers.
+    Extract only the metadata needed to rename a PDF from the first-page text.
+    Use only information explicitly written on the page.
+    Return a single JSON object with exactly these keys:
+    - "title": string
+    - "authors": array of strings
+    - "year": number or string
+    If a value is missing, use an empty string or empty array.
 
-rename:
-  author_key: authors
-  year_key: year
-  title_key: title
-
-prompt:
-  instructions: >
-    Extract only what is explicitly written on the page for factual fields.
-    For summary_ja, generate a short Japanese summary in 2-4 sentences based on the page.
-    If a field is missing, use an empty string or empty array.
+  extra_text: |
+    You are writing a companion text file for an academic paper.
+    Do not return JSON. Return plain text only.
+    Write concise labeled sections for affiliation, journal, doi, keywords, MSC,
+    arXiv category, and a short Japanese summary.
+    For factual fields, use only information explicitly written on the page.
+    For summaries, summarize based on the page.
